@@ -16,6 +16,10 @@ const NOISY_PATTERNS = [
 ];
 const PROTECT_DEVICE_CLASSES = new Set(["energy", "gas", "water", "monetary"]);
 
+const HINT_DOMAINS = new Set(["update", "image", "event", "button", "scene", "conversation", "tts", "stt", "wake_word", "ai_task", "notify", "remote", "camera"]);
+const BIG_DOMAINS = new Set(["sensor", "binary_sensor", "light", "switch", "climate", "cover", "media_player", "input_number", "input_boolean", "number", "select"]);
+const PRESENCE_DOMAINS = new Set(["person", "device_tracker", "zone", "alarm_control_panel", "lock"]);
+
 const WINDOWS = [[6, "6 h"], [24, "24 h"], [72, "3 days"], [168, "7 days"]];
 
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
@@ -37,6 +41,8 @@ class RecorderTunerPanel extends HTMLElement {
     this._filter = "suggested";
     this._data = null;
     this._ticked = new Set();
+    this._tickedDomains = new Set();
+    this._tab = "entities";
     this._loading = false;
     this._error = null;
     this._notice = null;
@@ -102,12 +108,14 @@ class RecorderTunerPanel extends HTMLElement {
 
   _status(e) {
     if (e.in_yaml) return e.recorded ? ["pending", "Excluded after restart"] : ["excluded", "Excluded"];
-    if (!e.recorded) return ["other", "Excluded by glob/domain rule"];
+    if (!e.recorded)
+      return this._data?.yaml?.domains?.includes(e.entity_id.split(".")[0]) ? ["other", "Excluded by domain"] : ["other", "Excluded by glob/domain rule"];
     return ["recorded", "Recorded"];
   }
 
   _resetTicks(withSuggestions) {
     this._ticked = new Set();
+    this._tickedDomains = new Set((this._data?.domains || []).filter((d) => d.in_yaml).map((d) => d.domain));
     for (const e of this._data?.entities || []) {
       if (e.in_yaml) this._ticked.add(e.entity_id);
       else if (withSuggestions && e.recorded && this._classify(e).suggest) this._ticked.add(e.entity_id);
@@ -122,16 +130,38 @@ class RecorderTunerPanel extends HTMLElement {
       if (want && !e.in_yaml) add.push(e.entity_id);
       if (!want && e.in_yaml) remove.push(e.entity_id);
     }
-    return { add, remove };
+    const addDomains = [], removeDomains = [];
+    for (const d of this._data?.domains || []) {
+      const want = this._tickedDomains.has(d.domain);
+      if (want && !d.in_yaml) addDomains.push(d.domain);
+      if (!want && d.in_yaml) removeDomains.push(d.domain);
+    }
+    return { add, remove, addDomains, removeDomains };
+  }
+
+  _domainInfo(d) {
+    if (d.energy) return { lock: true, reason: `Contains ${d.energy} Energy dashboard entit${d.energy === 1 ? "y" : "ies"} – can't be excluded as a whole` };
+    if (PRESENCE_DOMAINS.has(d.domain)) return { reason: "Presence/security history – usually worth keeping" };
+    if (BIG_DOMAINS.has(d.domain)) return { reason: `Excludes history and statistics for all ${d.entities} ${d.domain} entities – prefer excluding individual entities` };
+    if (HINT_DOMAINS.has(d.domain)) return { reason: "Commonly excluded – history rarely useful" };
+    return { reason: "" };
+  }
+
+  _domainStatus(d) {
+    if (d.in_yaml) return d.recorded ? ["pending", "Excluded after restart"] : ["excluded", "Excluded"];
+    if (!d.sampled) return ["recorded", "No entities"];
+    if (d.recorded === 0) return ["other", "Excluded by other rules"];
+    if (d.recorded < d.sampled) return ["other", `Partly excluded (${d.sampled - d.recorded} of ${d.sampled})`];
+    return ["recorded", "Recorded"];
   }
 
   async _save() {
-    const { add, remove } = this._changes();
+    const { add, remove, addDomains, removeDomains } = this._changes();
     this._busy = true; this._render();
     try {
-      const r = await this._hass.callWS({ type: "recorder_tuner/save", add, remove });
+      const r = await this._hass.callWS({ type: "recorder_tuner/save", add, remove, add_domains: addDomains, remove_domains: removeDomains });
       this._notice = r.changed
-        ? { kind: "ok", saved: r, text: `Saved ${r.file}: +${r.added.length} / −${r.removed.length}. Backup: ${r.backup.split("/").pop()}. Restart Home Assistant to apply.` }
+        ? { kind: "ok", saved: r, text: `Saved ${r.file}: entities +${r.added.length} / −${r.removed.length}, domains +${r.added_domains.length} / −${r.removed_domains.length}. Backup: ${r.backup.split("/").pop()}. Restart Home Assistant to apply.` }
         : { kind: "info", text: "Nothing to change." };
       this._confirmSave = false;
       this._busy = false;
@@ -149,13 +179,12 @@ class RecorderTunerPanel extends HTMLElement {
 
   // when: "now" | "after_restart"
   async _purge(when) {
-    const ids = this._excludedIds();
     this._busy = true; this._confirm = null; this._render();
     try {
-      const r = await this._hass.callWS({ type: "recorder_tuner/purge", entity_ids: ids, when });
+      const r = await this._hass.callWS({ type: "recorder_tuner/purge", when });
       this._notice = r.restarting
-        ? { kind: "ok", text: `Restarting… Once Home Assistant is back, the old history of ${r.queued} excluded entities is purged and the database repacked (a notification confirms it). Reload this page in a minute or two.` }
-        : { kind: "ok", text: `Purge queued for ${r.queued} entities, then a repack (SQLite VACUUM). The file shrinks when the recorder finishes, which can take several minutes on a large database.` };
+        ? { kind: "ok", text: "Restarting… Once Home Assistant is back, stored history of every entity that is no longer recorded (by entity, domain or glob rule) is purged and the database repacked; a notification confirms it. Reload this page in a minute or two." }
+        : { kind: "ok", text: `Purge queued for ${r.queued} no-longer-recorded entities, then a repack (SQLite VACUUM). The file shrinks when the recorder finishes, which can take several minutes on a large database.` };
     } catch (e) {
       this._notice = { kind: "error", text: e.message || String(e) };
     }
@@ -185,14 +214,19 @@ class RecorderTunerPanel extends HTMLElement {
 
   _render() {
     const d = this._data;
-    const { add, remove } = this._changes();
+    const { add, remove, addDomains, removeDomains } = this._changes();
+    const nChanges = add.length + remove.length + addDomains.length + removeDomains.length;
     const rows = (d?.entities || []).map((e) => ({ e, c: this._classify(e), s: this._status(e) }));
     let shown = rows;
     if (this._filter === "suggested") shown = rows.filter((r) => r.c.suggest || r.e.in_yaml || this._ticked.has(r.e.entity_id));
     else if (this._filter === "chatty") shown = rows.filter((r) => r.e.per_day >= this._threshold || r.e.in_yaml);
     const total = d?.total_per_day || 0;
-    const tickedPerDay = rows.filter((r) => this._ticked.has(r.e.entity_id) && r.e.recorded).reduce((s, r) => s + r.e.per_day, 0);
-    const pendingExcluded = rows.filter((r) => r.e.in_yaml).length;
+    const tickedDom = this._tickedDomains;
+    const tickedPerDay =
+      (d?.domains || []).filter((x) => tickedDom.has(x.domain) && x.recorded).reduce((s, x) => s + x.per_day, 0) +
+      rows.filter((r) => this._ticked.has(r.e.entity_id) && r.e.recorded && !tickedDom.has(r.e.entity_id.split(".")[0])).reduce((s, r) => s + r.e.per_day, 0);
+    const pendingExcluded = d?.purgeable || 0;
+    const domainRows = [...(d?.domains || [])].sort((a, b) => b.per_day - a.per_day);
 
     this.shadowRoot.innerHTML = `
       <style>${STYLE}</style>
@@ -214,7 +248,12 @@ class RecorderTunerPanel extends HTMLElement {
           <div class="stat"><div class="k">Database</div><div class="v">${fmtBytes(d?.db_size)}</div><div class="s">${esc(d?.db_engine || "")}</div></div>
           <div class="stat"><div class="k">State rows / day</div><div class="v">${d ? fmtInt(total) : "—"}</div><div class="s">${d ? `measured over ${d.hours_covered} h${d.hours_covered < d.hours_requested * 0.9 ? " (DB holds less – extrapolated)" : ""}` : ""}</div></div>
           <div class="stat"><div class="k">Ticked would save</div><div class="v">${d ? fmtInt(tickedPerDay) : "—"}</div><div class="s">${total ? `${((tickedPerDay / total) * 100).toFixed(1)}% of writes` : ""}</div></div>
-          <div class="stat"><div class="k">Excluded in YAML</div><div class="v">${pendingExcluded}</div><div class="s">${esc(d?.yaml?.file?.split("/").pop() || "")}${d?.yaml?.entity_globs?.length ? ` · ${d.yaml.entity_globs.length} glob(s)` : ""}</div></div>
+          <div class="stat"><div class="k">Excluded in YAML</div><div class="v">${d?.yaml?.entities?.length ?? 0}<span class="unit"> entities</span> ${d?.yaml?.domains?.length ?? 0}<span class="unit"> domains</span></div><div class="s">${esc(d?.yaml?.file?.split("/").pop() || "")}${d?.yaml?.entity_globs?.length ? ` · ${d.yaml.entity_globs.length} glob(s)` : ""} · ${pendingExcluded} not recorded</div></div>
+        </div>
+
+        <div class="tabs">
+          <button class="tab ${this._tab === "entities" ? "active" : ""}" data-tab="entities">Entities</button>
+          <button class="tab ${this._tab === "domains" ? "active" : ""}" data-tab="domains">Domains</button>
         </div>
 
         <div class="controls">
@@ -224,7 +263,7 @@ class RecorderTunerPanel extends HTMLElement {
           <label>Suggest above
             <input data-ctl="threshold" type="number" min="50" step="50" value="${this._threshold}"> rows/day
           </label>
-          <label>Show
+          <label class="${this._tab === "domains" ? "hide" : ""}">Show
             <select data-ctl="filter">
               <option value="suggested" ${this._filter === "suggested" ? "selected" : ""}>Suggested + excluded</option>
               <option value="chatty" ${this._filter === "chatty" ? "selected" : ""}>All above threshold</option>
@@ -238,19 +277,24 @@ class RecorderTunerPanel extends HTMLElement {
         </div>
 
         <div class="savebar">
-          <span>${add.length || remove.length ? `<b>Pending:</b> exclude ${add.length}, stop excluding ${remove.length}` : "No pending changes"}</span>
+          <span>${nChanges ? `<b>Pending:</b> ${[
+            add.length && `exclude ${add.length} entit${add.length === 1 ? "y" : "ies"}`,
+            remove.length && `stop excluding ${remove.length} entit${remove.length === 1 ? "y" : "ies"}`,
+            addDomains.length && `exclude domain${addDomains.length === 1 ? "" : "s"} ${addDomains.join(", ")}`,
+            removeDomains.length && `stop excluding ${removeDomains.join(", ")}`,
+          ].filter(Boolean).join(" · ")}` : "No pending changes"}</span>
           <span class="grow"></span>
           ${pendingExcluded && !this._notice?.saved ? `
             <span title="recorder.purge_entities for the excluded entities, then recorder.purge with repack: true (compacts the file)">
-              ${this._actionButton("purge", "Purge now", `Confirm purge of ${pendingExcluded}`)}
+              ${this._actionButton("purge", `Purge now (${pendingExcluded})`, `Confirm purge of ${pendingExcluded}`)}
               ${this._actionButton("restart-purge", "Restart & purge", "Confirm restart + purge")}
             </span>` : ""}
           ${this._confirmSave
             ? `<button class="primary" data-act="save-confirm" ${this._busy ? "disabled" : ""}>Confirm – write ${esc(d?.yaml?.file?.split("/").pop() || "configuration.yaml")}</button><button data-act="save-cancel">Cancel</button>`
-            : `<button class="primary" data-act="save" ${add.length || remove.length ? "" : "disabled"} ${d?.yaml?.ok ? "" : "disabled"}>Save to configuration.yaml</button>`}
+            : `<button class="primary" data-act="save" ${nChanges ? "" : "disabled"} ${d?.yaml?.ok ? "" : "disabled"}>Save to configuration.yaml</button>`}
         </div>
 
-        <table>
+        ${this._tab === "domains" ? this._domainTable(domainRows, total) : `<table>
           <thead><tr>
             <th class="cb"></th><th>Entity</th><th class="num">Rows/day</th><th class="num">Share</th>
             <th>Class</th><th>Status</th><th>Why</th>
@@ -274,13 +318,42 @@ class RecorderTunerPanel extends HTMLElement {
               </tr>`;
             }).join("")}
           </tbody>
-        </table>
+        </table>`}
         <p class="foot">Exclusions only stop <i>new</i> rows and need a full restart. <b>Restart &amp; purge</b> restarts, then deletes the excluded entities’ old rows and repacks (VACUUMs) the database so the file actually shrinks. A plain purge without repack frees space inside the file but doesn’t make it smaller. A timestamped backup of the edited file is kept next to it (last 5).</p>
       </div>`;
 
     const mb = this.shadowRoot.querySelector("ha-menu-button");
     if (mb) { mb.hass = this._hass; mb.narrow = this._narrow; }
     this._bind();
+  }
+
+  _domainTable(domainRows, total) {
+    return `<table>
+      <thead><tr>
+        <th class="cb"></th><th>Domain</th><th class="num">Entities</th><th class="num">Rows/day</th><th class="num">Share</th>
+        <th>Status</th><th>Note</th>
+      </tr></thead>
+      <tbody>
+        ${!domainRows.length ? `<tr><td colspan="7" class="empty">${this._loading ? "Querying the recorder…" : "No domains"}</td></tr>` : ""}
+        ${domainRows.map((x) => {
+          const info = this._domainInfo(x);
+          const st = this._domainStatus(x);
+          const ticked = this._tickedDomains.has(x.domain);
+          const locked = info.lock && !x.in_yaml;
+          const change = ticked !== x.in_yaml ? (ticked ? "adding" : "removing") : "";
+          const share = total ? (x.per_day / total) * 100 : 0;
+          return `<tr class="${change} ${info.lock ? "protect" : ""}">
+            <td class="cb"><input type="checkbox" data-domain="${esc(x.domain)}" ${ticked ? "checked" : ""} ${locked ? "disabled" : ""}></td>
+            <td><div class="name">${esc(x.domain)}</div></td>
+            <td class="num">${fmtInt(x.entities)}</td>
+            <td class="num">${fmtInt(x.per_day)}</td>
+            <td class="num"><div class="bar"><span style="width:${Math.min(100, share)}%"></span></div>${share.toFixed(1)}%</td>
+            <td><span class="pill ${st[0]}">${st[1]}</span></td>
+            <td class="muted">${esc(info.reason)}</td>
+          </tr>`;
+        }).join("")}
+      </tbody>
+    </table>`;
   }
 
   _bind() {
@@ -291,6 +364,13 @@ class RecorderTunerPanel extends HTMLElement {
         this._confirmSave = false;
         this._render();
       }));
+    root.querySelectorAll("input[type=checkbox][data-domain]").forEach((cb) =>
+      cb.addEventListener("change", () => {
+        cb.checked ? this._tickedDomains.add(cb.dataset.domain) : this._tickedDomains.delete(cb.dataset.domain);
+        this._confirmSave = false;
+        this._render();
+      }));
+    root.querySelectorAll("[data-tab]").forEach((b) => b.addEventListener("click", () => { this._tab = b.dataset.tab; this._render(); }));
     root.querySelector("[data-ctl=hours]")?.addEventListener("change", (ev) => { this._hours = Number(ev.target.value); this._load(); });
     root.querySelector("[data-ctl=threshold]")?.addEventListener("change", (ev) => {
       this._threshold = Math.max(50, Number(ev.target.value) || 1000);
@@ -300,7 +380,7 @@ class RecorderTunerPanel extends HTMLElement {
     root.querySelectorAll("[data-act]").forEach((b) => b.addEventListener("click", () => {
       switch (b.dataset.act) {
         case "reload": this._notice = null; this._load(); break;
-        case "suggest": this._resetTicks(true); this._render(); break;
+        case "suggest": { const keep = this._tickedDomains; this._resetTicks(true); this._tickedDomains = keep; this._render(); break; }
         case "reset": this._resetTicks(false); this._confirmSave = false; this._render(); break;
         case "save": this._confirmSave = true; this._render(); break;
         case "save-cancel": this._confirmSave = false; this._render(); break;
@@ -359,6 +439,11 @@ const STYLE = `
   .notice.ok { border-color:var(--success-color,#43a047); }
   .notice .actions { margin-top:8px; }
   .notice .x { position:absolute; top:6px; right:6px; border:none; font-size:18px; padding:2px 8px; color:inherit; }
+  .tabs { display:flex; gap:4px; margin-bottom:12px; border-bottom:1px solid var(--divider-color); }
+  .tab { border:none; border-radius:0; border-bottom:2px solid transparent; color:var(--secondary-text-color); padding:8px 16px; }
+  .tab.active { color:var(--primary-color); border-bottom-color:var(--primary-color); }
+  .hide { display:none; }
+  .unit { font-size:13px; color:var(--secondary-text-color); font-weight:400; }
   .empty { text-align:center; color:var(--secondary-text-color); padding:24px; }
   .foot { color:var(--secondary-text-color); font-size:13px; margin-top:12px; }
   code { font-family:var(--code-font-family, monospace); }

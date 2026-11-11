@@ -40,7 +40,7 @@ def async_register(hass: HomeAssistant) -> None:
 # --------------------------------------------------------------------------- DB
 
 
-def _query_counts(hass: HomeAssistant, since_ts: float, limit: int) -> dict[str, Any]:
+def _query_counts(hass: HomeAssistant, since_ts: float) -> dict[str, Any]:
     """Count state rows per entity since `since_ts` (runs in the recorder executor)."""
     with session_scope(hass=hass, read_only=True) as session:
         rows = session.execute(
@@ -48,9 +48,9 @@ def _query_counts(hass: HomeAssistant, since_ts: float, limit: int) -> dict[str,
                 "SELECT sm.entity_id, COUNT(*) AS c "
                 "FROM states s JOIN states_meta sm ON s.metadata_id = sm.metadata_id "
                 "WHERE s.last_updated_ts >= :since "
-                "GROUP BY sm.entity_id ORDER BY c DESC LIMIT :limit"
+                "GROUP BY sm.entity_id ORDER BY c DESC"
             ),
-            {"since": since_ts, "limit": limit},
+            {"since": since_ts},
         ).all()
         total = session.execute(
             text("SELECT COUNT(*) FROM states WHERE last_updated_ts >= :since"),
@@ -62,6 +62,12 @@ def _query_counts(hass: HomeAssistant, since_ts: float, limit: int) -> dict[str,
         "total": int(total or 0),
         "oldest": float(oldest) if oldest else None,
     }
+
+
+def _query_known_ids(hass: HomeAssistant) -> list[str]:
+    """Every entity id the recorder has ever stored states for."""
+    with session_scope(hass=hass, read_only=True) as session:
+        return [r[0] for r in session.execute(text("SELECT entity_id FROM states_meta")).all() if r[0]]
 
 
 def _db_size(db_url: str) -> int | None:
@@ -122,7 +128,8 @@ async def ws_analyze(hass: HomeAssistant, connection: websocket_api.ActiveConnec
     since = now - msg["hours"] * 3600
 
     try:
-        db = await instance.async_add_executor_job(_query_counts, hass, since, msg["limit"])
+        db = await instance.async_add_executor_job(_query_counts, hass, since)
+        known_ids = await instance.async_add_executor_job(_query_known_ids, hass)
     except Exception as err:  # noqa: BLE001
         _LOGGER.exception("Recorder query failed")
         connection.send_error(msg["id"], "query_failed", str(err))
@@ -153,7 +160,39 @@ async def ws_analyze(hass: HomeAssistant, connection: websocket_api.ActiveConnec
     hours_covered = max((now - covered_from) / 3600, 1 / 60)
 
     counts = dict(db["rows"])
-    ids = list(counts)
+    per_day = 24 / hours_covered
+
+    # Per-domain totals over *all* entities, not just the top N.
+    yaml_domains = set(yaml_info.get("domains", []))
+    domain_rows: dict[str, int] = {}
+    domain_entities: dict[str, int] = {}
+    for st in hass.states.async_all():
+        d = st.entity_id.split(".", 1)[0]
+        domain_entities[d] = domain_entities.get(d, 0) + 1
+    for entity_id, c in counts.items():
+        d = entity_id.split(".", 1)[0]
+        domain_rows[d] = domain_rows.get(d, 0) + c
+    domains = []
+    for d in sorted(set(domain_rows) | set(domain_entities) | yaml_domains):
+        sample = [s.entity_id for s in hass.states.async_all(d)][:200]
+        recorded_n = sum(1 for e in sample if is_entity_recorded(hass, e))
+        domains.append(
+            {
+                "domain": d,
+                "count": domain_rows.get(d, 0),
+                "per_day": round(domain_rows.get(d, 0) * per_day, 1),
+                "entities": domain_entities.get(d, 0),
+                "recorded": recorded_n,
+                "sampled": len(sample),
+                "in_yaml": d in yaml_domains,
+                "energy": sum(1 for e in energy if e.split(".", 1)[0] == d),
+            }
+        )
+
+    # Entities the recorder no longer records but still has rows for (any rule).
+    purgeable = [e for e in known_ids if not is_entity_recorded(hass, e)]
+
+    ids = [e for e, _ in db["rows"][: msg["limit"]]]
     for ent in yaml_info.get("entities", []):
         if ent not in counts:
             ids.append(ent)
@@ -167,7 +206,7 @@ async def ws_analyze(hass: HomeAssistant, connection: websocket_api.ActiveConnec
             {
                 "entity_id": entity_id,
                 "count": counts.get(entity_id, 0),
-                "per_day": round(counts.get(entity_id, 0) * 24 / hours_covered, 1),
+                "per_day": round(counts.get(entity_id, 0) * per_day, 1),
                 "name": attrs.get("friendly_name") or (reg.name or reg.original_name if reg else None),
                 "platform": reg.platform if reg else None,
                 "device_class": attrs.get("device_class") or (reg.device_class or reg.original_device_class if reg else None),
@@ -191,6 +230,8 @@ async def ws_analyze(hass: HomeAssistant, connection: websocket_api.ActiveConnec
             "db_engine": str(instance.db_url).split(":", 1)[0],
             "yaml": yaml_info,
             "entities": entities,
+            "domains": domains,
+            "purgeable": len(purgeable),
         },
     )
 
@@ -211,6 +252,8 @@ async def _config_errors(hass: HomeAssistant) -> set[str]:
         vol.Required("type"): f"{DOMAIN}/save",
         vol.Optional("add", default=[]): [cv.entity_id],
         vol.Optional("remove", default=[]): [cv.entity_id],
+        vol.Optional("add_domains", default=[]): [vol.Match(r"^[a-z0-9_]+$")],
+        vol.Optional("remove_domains", default=[]): [vol.Match(r"^[a-z0-9_]+$")],
     }
 )
 @websocket_api.async_response
@@ -220,7 +263,12 @@ async def ws_save(hass: HomeAssistant, connection: websocket_api.ActiveConnectio
 
     try:
         result = await hass.async_add_executor_job(
-            yaml_editor.apply_changes, hass.config.config_dir, msg["add"], msg["remove"]
+            yaml_editor.apply_changes,
+            hass.config.config_dir,
+            msg["add"],
+            msg["remove"],
+            msg["add_domains"],
+            msg["remove_domains"],
         )
     except yaml_editor.RecorderYamlError as err:
         connection.send_error(msg["id"], "yaml_error", str(err))
@@ -245,8 +293,9 @@ async def ws_save(hass: HomeAssistant, connection: websocket_api.ActiveConnectio
         return
 
     _LOGGER.info(
-        "Recorder Tuner updated %s (added %s, removed %s, backup %s)",
-        result.file, result.added, result.removed, result.backup,
+        "Recorder Tuner updated %s (entities +%s -%s, domains +%s -%s, backup %s)",
+        result.file, result.added, result.removed,
+        result.added_domains, result.removed_domains, result.backup,
     )
     connection.send_result(
         msg["id"],
@@ -256,6 +305,8 @@ async def ws_save(hass: HomeAssistant, connection: websocket_api.ActiveConnectio
             "backup": result.backup,
             "added": result.added,
             "removed": result.removed,
+            "added_domains": result.added_domains,
+            "removed_domains": result.removed_domains,
             "preexisting_errors": sorted(errors_before),
         },
     )
@@ -268,17 +319,20 @@ async def ws_save(hass: HomeAssistant, connection: websocket_api.ActiveConnectio
 @websocket_api.websocket_command(
     {
         vol.Required("type"): f"{DOMAIN}/purge",
-        vol.Optional("entity_ids", default=[]): [cv.entity_id],
         vol.Optional("when", default="now"): vol.In(["now", "after_restart"]),
     }
 )
 @websocket_api.async_response
 async def ws_purge(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict) -> None:
-    """Purge + repack now, or restart HA and purge once it is back up."""
-    ids: list[str] = msg["entity_ids"]
+    """Purge + repack now, or restart HA and purge once it is back up.
 
+    Covers every entity the recorder is *not* recording (by entity, domain or
+    glob rule) that still has rows. For after_restart the list is worked out
+    after the restart, so newly saved exclusions are included.
+    """
     if msg["when"] == "now":
         try:
+            ids = await purge.async_excluded_ids(hass)
             await purge.async_purge_now(hass, ids)
         except Exception as err:  # noqa: BLE001
             connection.send_error(msg["id"], "purge_failed", str(err))
@@ -296,8 +350,8 @@ async def ws_purge(hass: HomeAssistant, connection: websocket_api.ActiveConnecti
         )
         return
 
-    await purge.async_schedule_after_restart(hass, ids)
-    connection.send_result(msg["id"], {"queued": len(ids), "restarting": True})
+    await purge.async_schedule_after_restart(hass)
+    connection.send_result(msg["id"], {"queued": None, "restarting": True})
     hass.async_create_task(
         hass.services.async_call("homeassistant", "restart", {}, blocking=False),
         f"{DOMAIN}_restart",

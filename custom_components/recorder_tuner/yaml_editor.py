@@ -56,6 +56,8 @@ class EditResult:
     original_text: str
     added: list[str]
     removed: list[str]
+    added_domains: list[str] = field(default_factory=list)
+    removed_domains: list[str] = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- helpers
@@ -239,10 +241,48 @@ def read_excludes(config_dir: str) -> RecorderExcludes:
     return res
 
 
-def apply_changes(config_dir: str, add: list[str], remove: list[str]) -> EditResult:
-    """Add/remove entity IDs in recorder.exclude.entities and write the file."""
-    add_set = {e.strip() for e in add if e and e.strip()}
-    remove_set = {e.strip() for e in remove if e and e.strip()} - add_set
+def _edit_list(exclude: Any, key: str, add: set[str], remove: set[str]) -> tuple[list[str], list[str]]:
+    """Add/remove values in exclude[key] (a YAML list), keeping order and comments."""
+    seq = exclude.get(key)
+    if seq is None:
+        seq = CommentedSeq()
+    elif isinstance(seq, str):
+        seq = CommentedSeq([seq])
+    elif not isinstance(seq, list):
+        raise RecorderYamlError(f"recorder.exclude.{key} is not a list")
+
+    removed = [str(v) for v in seq if str(v) in remove]
+    for idx in range(len(seq) - 1, -1, -1):
+        if str(seq[idx]) in remove:
+            del seq[idx]
+    present = {str(v) for v in seq}
+    added = sorted(add - present)
+    for val in added:
+        seq.append(val)
+
+    if len(seq):
+        exclude[key] = seq
+    elif key in exclude:
+        del exclude[key]
+    return added, removed
+
+
+def _clean(values: list[str] | tuple[str, ...] | None) -> set[str]:
+    return {v.strip() for v in (values or []) if v and v.strip()}
+
+
+def apply_changes(
+    config_dir: str,
+    add: list[str],
+    remove: list[str],
+    add_domains: list[str] | None = None,
+    remove_domains: list[str] | None = None,
+) -> EditResult:
+    """Add/remove entity IDs and domains in recorder.exclude and write the file."""
+    add_set = _clean(add)
+    remove_set = _clean(remove) - add_set
+    add_dom = _clean(add_domains)
+    remove_dom = _clean(remove_domains) - add_dom
 
     loc = _locate(config_dir)
     rec = loc.recorder
@@ -255,31 +295,11 @@ def apply_changes(config_dir: str, add: list[str], remove: list[str]) -> EditRes
     elif not isinstance(exclude, dict):
         raise RecorderYamlError("recorder.exclude is not a mapping")
 
-    entities = exclude.get("entities")
-    if entities is None:
-        entities = CommentedSeq()
-    elif isinstance(entities, str):
-        entities = CommentedSeq([entities])
-    elif not isinstance(entities, list):
-        raise RecorderYamlError("recorder.exclude.entities is not a list")
+    added, removed = _edit_list(exclude, "entities", add_set, remove_set)
+    added_d, removed_d = _edit_list(exclude, "domains", add_dom, remove_dom)
 
-    current = [str(e) for e in entities]
-    removed = [e for e in current if e in remove_set]
-    for idx in range(len(entities) - 1, -1, -1):
-        if str(entities[idx]) in remove_set:
-            del entities[idx]
-    present = {str(e) for e in entities}
-    added = sorted(add_set - present)
-    for ent in added:
-        entities.append(ent)
-
-    if not added and not removed:
+    if not (added or removed or added_d or removed_d):
         return EditResult(str(loc.path), None, loc.text, [], [])
-
-    if len(entities):
-        exclude["entities"] = entities
-    elif "entities" in exclude:
-        del exclude["entities"]
 
     if len(exclude):
         rec["exclude"] = exclude
@@ -306,7 +326,7 @@ def apply_changes(config_dir: str, add: list[str], remove: list[str]) -> EditRes
 
     backup = _backup(loc.path)
     _atomic_write(loc.path, new_text)
-    return EditResult(str(loc.path), backup, loc.text, added, removed)
+    return EditResult(str(loc.path), backup, loc.text, added, removed, added_d, removed_d)
 
 
 def restore(path: str, text: str) -> None:

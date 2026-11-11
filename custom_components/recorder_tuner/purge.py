@@ -38,9 +38,23 @@ async def async_purge_now(hass: HomeAssistant, entity_ids: list[str], repack: bo
     _LOGGER.info("Recorder Tuner queued purge for %d entities (repack=%s)", len(entity_ids), repack)
 
 
-async def async_schedule_after_restart(hass: HomeAssistant, entity_ids: list[str]) -> None:
+async def async_excluded_ids(hass: HomeAssistant) -> list[str]:
+    """Entities with stored rows that the recorder currently does not record."""
+    from homeassistant.components.recorder import get_instance, is_entity_recorded
+    from homeassistant.components.recorder.util import session_scope
+    from sqlalchemy import text
+
+    def _known() -> list[str]:
+        with session_scope(hass=hass, read_only=True) as session:
+            return [r[0] for r in session.execute(text("SELECT entity_id FROM states_meta")).all() if r[0]]
+
+    known = await get_instance(hass).async_add_executor_job(_known)
+    return sorted(e for e in known if not is_entity_recorded(hass, e))
+
+
+async def async_schedule_after_restart(hass: HomeAssistant) -> None:
     """Remember a purge to run once HA has started again."""
-    await _store(hass).async_save({"entity_ids": sorted(set(entity_ids)), "repack": True})
+    await _store(hass).async_save({"all_excluded": True, "repack": True})
 
 
 async def async_run_pending(hass: HomeAssistant) -> None:
@@ -53,8 +67,12 @@ async def async_run_pending(hass: HomeAssistant) -> None:
     async def _run(_hass: HomeAssistant) -> None:
         # Clear first so a crash during purge can't cause a purge loop on every boot.
         await store.async_remove()
-        ids = list(pending.get("entity_ids", []))
         try:
+            ids = (
+                await async_excluded_ids(hass)
+                if pending.get("all_excluded")
+                else list(pending.get("entity_ids", []))
+            )
             await async_purge_now(hass, ids, bool(pending.get("repack", True)))
         except Exception as err:  # noqa: BLE001
             _LOGGER.exception("Scheduled purge failed")
@@ -67,7 +85,8 @@ async def async_run_pending(hass: HomeAssistant) -> None:
             return
         persistent_notification.async_create(
             hass,
-            f"Purging the old history of {len(ids)} excluded entities and repacking the database. "
+            f"Purging the stored history of {len(ids)} entities that are no longer recorded, "
+            "then repacking the database. "
             "This runs in the background and can take several minutes on a large database; "
             "the recorder catches up afterwards.",
             title="Recorder Tuner",
