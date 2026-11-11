@@ -450,4 +450,4 @@ const STYLE = `
   @media (max-width: 800px) { th:nth-child(5), td:nth-child(5), th:nth-child(7), td:nth-child(7) { display:none; } }
 `;
 
-customElements.define("recorder-tuner-panel", RecorderTunerPanel);
+if (!customElements.get("recorder-tuner-panel")) customElements.define("recorder-tuner-panel", RecorderTunerPanel);
