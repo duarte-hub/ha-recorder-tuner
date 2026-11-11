@@ -1,0 +1,15 @@
+{
+  "domain": "recorder_tuner",
+  "name": "Recorder Tuner",
+  "after_dependencies": ["energy"],
+  "codeowners": ["@duarte-hub"],
+  "config_flow": true,
+  "dependencies": ["recorder", "http", "frontend", "panel_custom", "websocket_api"],
+  "documentation": "https://github.com/duarte-hub/ha-recorder-tuner",
+  "integration_type": "service",
+  "iot_class": "calculated",
+  "issue_tracker": "https://github.com/duarte-hub/ha-recorder-tuner/issues",
+  "requirements": ["ruamel.yaml>=0.17.21"],
+  "single_config_entry": true,
+  "version": "0.1.0"
+}
