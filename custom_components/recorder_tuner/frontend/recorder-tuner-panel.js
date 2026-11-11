@@ -115,11 +115,17 @@ class RecorderTunerPanel extends HTMLElement {
 
   _resetTicks(withSuggestions) {
     this._ticked = new Set();
+    this._keepDays = this._currentKeepDays();
     this._tickedDomains = new Set((this._data?.domains || []).filter((d) => d.in_yaml).map((d) => d.domain));
     for (const e of this._data?.entities || []) {
       if (e.in_yaml) this._ticked.add(e.entity_id);
       else if (withSuggestions && e.recorded && this._classify(e).suggest) this._ticked.add(e.entity_id);
     }
+  }
+
+  _currentKeepDays() {
+    const d = this._data;
+    return d?.yaml?.purge_keep_days ?? d?.keep_days_running ?? 10;
   }
 
   _changes() {
@@ -136,7 +142,9 @@ class RecorderTunerPanel extends HTMLElement {
       if (want && !d.in_yaml) addDomains.push(d.domain);
       if (!want && d.in_yaml) removeDomains.push(d.domain);
     }
-    return { add, remove, addDomains, removeDomains };
+    const cur = this._currentKeepDays();
+    const keepDays = this._keepDays && this._keepDays !== cur ? this._keepDays : null;
+    return { add, remove, addDomains, removeDomains, keepDays };
   }
 
   _domainInfo(d) {
@@ -156,12 +164,12 @@ class RecorderTunerPanel extends HTMLElement {
   }
 
   async _save() {
-    const { add, remove, addDomains, removeDomains } = this._changes();
+    const { add, remove, addDomains, removeDomains, keepDays } = this._changes();
     this._busy = true; this._render();
     try {
-      const r = await this._hass.callWS({ type: "recorder_tuner/save", add, remove, add_domains: addDomains, remove_domains: removeDomains });
+      const r = await this._hass.callWS({ type: "recorder_tuner/save", add, remove, add_domains: addDomains, remove_domains: removeDomains, ...(keepDays ? { keep_days: keepDays } : {}) });
       this._notice = r.changed
-        ? { kind: "ok", saved: r, text: `Saved ${r.file}: entities +${r.added.length} / −${r.removed.length}, domains +${r.added_domains.length} / −${r.removed_domains.length}. Backup: ${r.backup.split("/").pop()}. Restart Home Assistant to apply.` }
+        ? { kind: "ok", saved: r, text: `Saved ${r.file}: entities +${r.added.length} / −${r.removed.length}, domains +${r.added_domains.length} / −${r.removed_domains.length}${r.keep_days ? `, history ${r.keep_days[0] ?? "default"} → ${r.keep_days[1]} days` : ""}. Backup: ${r.backup.split("/").pop()}. Restart Home Assistant to apply.` }
         : { kind: "info", text: "Nothing to change." };
       this._confirmSave = false;
       this._busy = false;
@@ -214,8 +222,9 @@ class RecorderTunerPanel extends HTMLElement {
 
   _render() {
     const d = this._data;
-    const { add, remove, addDomains, removeDomains } = this._changes();
-    const nChanges = add.length + remove.length + addDomains.length + removeDomains.length;
+    const { add, remove, addDomains, removeDomains, keepDays } = this._changes();
+    const nChanges = add.length + remove.length + addDomains.length + removeDomains.length + (keepDays ? 1 : 0);
+    const curKeep = this._currentKeepDays();
     const rows = (d?.entities || []).map((e) => ({ e, c: this._classify(e), s: this._status(e) }));
     let shown = rows;
     if (this._filter === "suggested") shown = rows.filter((r) => r.c.suggest || r.e.in_yaml || this._ticked.has(r.e.entity_id));
@@ -270,6 +279,10 @@ class RecorderTunerPanel extends HTMLElement {
               <option value="all" ${this._filter === "all" ? "selected" : ""}>Top ${rows.length}</option>
             </select>
           </label>
+          <label title="recorder: purge_keep_days – how many days of detailed state history to keep. Long-term hourly statistics are kept regardless.">Keep history
+            <input data-ctl="keepdays" type="number" min="1" max="365" step="1" value="${this._keepDays ?? curKeep}"> days
+            ${keepDays ? `<span class="hint">${keepDays < curKeep ? `≈ ${Math.round((1 - keepDays / curKeep) * 100)}% less state history` : `≈ ${Math.round((keepDays / curKeep - 1) * 100)}% more state history`}</span>` : ""}
+          </label>
           <span class="grow"></span>
           <button data-act="reload" ${this._loading ? "disabled" : ""}>${this._loading ? "Analysing…" : "Re-analyse"}</button>
           <button data-act="suggest">Tick suggestions</button>
@@ -282,6 +295,7 @@ class RecorderTunerPanel extends HTMLElement {
             remove.length && `stop excluding ${remove.length} entit${remove.length === 1 ? "y" : "ies"}`,
             addDomains.length && `exclude domain${addDomains.length === 1 ? "" : "s"} ${addDomains.join(", ")}`,
             removeDomains.length && `stop excluding ${removeDomains.join(", ")}`,
+            keepDays && `keep history ${curKeep} → ${keepDays} days`,
           ].filter(Boolean).join(" · ")}` : "No pending changes"}</span>
           <span class="grow"></span>
           ${pendingExcluded && !this._notice?.saved ? `
@@ -376,6 +390,12 @@ class RecorderTunerPanel extends HTMLElement {
       this._threshold = Math.max(50, Number(ev.target.value) || 1000);
       this._render();
     });
+    root.querySelector("[data-ctl=keepdays]")?.addEventListener("change", (ev) => {
+      const v = Math.round(Number(ev.target.value));
+      this._keepDays = v >= 1 && v <= 365 ? v : this._currentKeepDays();
+      this._confirmSave = false;
+      this._render();
+    });
     root.querySelector("[data-ctl=filter]")?.addEventListener("change", (ev) => { this._filter = ev.target.value; this._render(); });
     root.querySelectorAll("[data-act]").forEach((b) => b.addEventListener("click", () => {
       switch (b.dataset.act) {
@@ -443,6 +463,8 @@ const STYLE = `
   .tab { border:none; border-radius:0; border-bottom:2px solid transparent; color:var(--secondary-text-color); padding:8px 16px; }
   .tab.active { color:var(--primary-color); border-bottom-color:var(--primary-color); }
   .hide { display:none; }
+  .hint { font-size:12px; color:var(--primary-color); }
+  input[data-ctl=keepdays] { width:60px; }
   .unit { font-size:13px; color:var(--secondary-text-color); font-weight:400; }
   .empty { text-align:center; color:var(--secondary-text-color); padding:24px; }
   .foot { color:var(--secondary-text-color); font-size:13px; margin-top:12px; }

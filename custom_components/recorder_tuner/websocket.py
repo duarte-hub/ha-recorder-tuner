@@ -148,6 +148,7 @@ async def ws_analyze(hass: HomeAssistant, connection: websocket_api.ActiveConnec
             "entity_globs": excl.entity_globs,
             "domains": excl.domains,
             "has_include_filter": excl.has_include_filter,
+            "purge_keep_days": excl.purge_keep_days,
         }
     except Exception as err:  # noqa: BLE001
         yaml_info = {"ok": False, "error": str(err), "entities": []}
@@ -232,6 +233,7 @@ async def ws_analyze(hass: HomeAssistant, connection: websocket_api.ActiveConnec
             "entities": entities,
             "domains": domains,
             "purgeable": len(purgeable),
+            "keep_days_running": getattr(instance, "keep_days", None),
         },
     )
 
@@ -254,6 +256,7 @@ async def _config_errors(hass: HomeAssistant) -> set[str]:
         vol.Optional("remove", default=[]): [cv.entity_id],
         vol.Optional("add_domains", default=[]): [vol.Match(r"^[a-z0-9_]+$")],
         vol.Optional("remove_domains", default=[]): [vol.Match(r"^[a-z0-9_]+$")],
+        vol.Optional("keep_days"): vol.All(vol.Coerce(int), vol.Range(min=1, max=3650)),
     }
 )
 @websocket_api.async_response
@@ -269,6 +272,7 @@ async def ws_save(hass: HomeAssistant, connection: websocket_api.ActiveConnectio
             msg["remove"],
             msg["add_domains"],
             msg["remove_domains"],
+            msg.get("keep_days"),
         )
     except yaml_editor.RecorderYamlError as err:
         connection.send_error(msg["id"], "yaml_error", str(err))
@@ -307,6 +311,7 @@ async def ws_save(hass: HomeAssistant, connection: websocket_api.ActiveConnectio
             "removed": result.removed,
             "added_domains": result.added_domains,
             "removed_domains": result.removed_domains,
+            "keep_days": list(result.keep_days) if result.keep_days else None,
             "preexisting_errors": sorted(errors_before),
         },
     )

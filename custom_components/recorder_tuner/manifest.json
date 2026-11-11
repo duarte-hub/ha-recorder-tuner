@@ -11,5 +11,5 @@
   "issue_tracker": "https://github.com/duarte-hub/ha-recorder-tuner/issues",
   "requirements": ["ruamel.yaml>=0.17.21"],
   "single_config_entry": true,
-  "version": "0.3.1"
+  "version": "0.4.0"
 }

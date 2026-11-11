@@ -45,6 +45,7 @@ class RecorderExcludes:
     entity_globs: list[str] = field(default_factory=list)
     domains: list[str] = field(default_factory=list)
     has_include_filter: bool = False
+    purge_keep_days: int | None = None
 
 
 @dataclass
@@ -58,6 +59,7 @@ class EditResult:
     removed: list[str]
     added_domains: list[str] = field(default_factory=list)
     removed_domains: list[str] = field(default_factory=list)
+    keep_days: tuple[int | None, int | None] | None = None
 
 
 # --------------------------------------------------------------------------- helpers
@@ -237,6 +239,8 @@ def read_excludes(config_dir: str) -> RecorderExcludes:
         res.entities = _as_list(exclude.get("entities"))
         res.entity_globs = _as_list(exclude.get("entity_globs"))
         res.domains = _as_list(exclude.get("domains"))
+    kd = rec.get("purge_keep_days")
+    res.purge_keep_days = int(kd) if isinstance(kd, int) else None
     res.has_include_filter = isinstance(rec.get("include"), dict) and bool(rec.get("include"))
     return res
 
@@ -277,6 +281,7 @@ def apply_changes(
     remove: list[str],
     add_domains: list[str] | None = None,
     remove_domains: list[str] | None = None,
+    keep_days: int | None = None,
 ) -> EditResult:
     """Add/remove entity IDs and domains in recorder.exclude and write the file."""
     add_set = _clean(add)
@@ -298,7 +303,16 @@ def apply_changes(
     added, removed = _edit_list(exclude, "entities", add_set, remove_set)
     added_d, removed_d = _edit_list(exclude, "domains", add_dom, remove_dom)
 
-    if not (added or removed or added_d or removed_d):
+    kd_change = None
+    if keep_days is not None:
+        if not 1 <= int(keep_days) <= 3650:
+            raise RecorderYamlError("purge_keep_days must be between 1 and 3650")
+        old = rec.get("purge_keep_days")
+        if old != int(keep_days):
+            rec["purge_keep_days"] = int(keep_days)
+            kd_change = (old if isinstance(old, int) else None, int(keep_days))
+
+    if not (added or removed or added_d or removed_d or kd_change):
         return EditResult(str(loc.path), None, loc.text, [], [])
 
     if len(exclude):
@@ -326,7 +340,7 @@ def apply_changes(
 
     backup = _backup(loc.path)
     _atomic_write(loc.path, new_text)
-    return EditResult(str(loc.path), backup, loc.text, added, removed, added_d, removed_d)
+    return EditResult(str(loc.path), backup, loc.text, added, removed, added_d, removed_d, kd_change)
 
 
 def restore(path: str, text: str) -> None:
