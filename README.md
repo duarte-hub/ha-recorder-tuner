@@ -13,7 +13,7 @@ Find the entities that are bloating your recorder database, tick the ones you do
   - Not ticked by default: real power (W) and automations/scripts. You can still tick them yourself.
 - **Writes** your ticks to `recorder: exclude: entities:`, and unticking removes an entity from that list. It only re-emits the `recorder:` block, so the rest of the file stays byte-for-byte identical. Comments, quotes and `!secret` are kept, and `recorder: !include recorder.yaml` is followed.
 - **Protects your config**: it writes a timestamped backup first (the last 5 are kept) and runs Home Assistant's config check afterwards. If the edit introduced any new errors, the file is rolled back automatically.
-- **Cleans up**: one button runs `recorder.purge_entities` for everything excluded and then `recorder.purge` with `repack: true` to reclaim disk space. There's also a restart button.
+- **Cleans up**: **Restart & purge** restarts HA, then (once it's back up) runs `recorder.purge_entities` for everything excluded followed by `recorder.purge` with `repack: true`, and posts a notification. The repack (SQLite `VACUUM`) is what actually shrinks the file; a purge without it only frees space inside the file. **Purge now** does the same without restarting.
 
 Entities excluded by a glob or domain rule you wrote yourself show as "Excluded by glob/domain rule" and are left alone.
 
@@ -29,8 +29,7 @@ Entities excluded by a glob or domain rule you wrote yourself show as "Excluded 
 1. Pick a window (24 h is a good default) and a threshold (1000 rows/day ≈ one write every 90 s).
 2. Review the ticks. Use **Show → All above threshold** to see everything chatty.
 3. **Save to configuration.yaml** → **Confirm**.
-4. **Restart Home Assistant**. Recorder filters only change on a full restart. Afterwards the status column changes from *Excluded after restart* to *Excluded*.
-5. Optional: **Purge old history of excluded** to delete the existing rows and repack the database now, rather than waiting for `purge_keep_days`.
+4. **Restart & purge** (or **Restart only**). Recorder filters only change on a full restart. Afterwards the status column changes from *Excluded after restart* to *Excluded*, and the database shrinks once the repack finishes. Repacking needs free disk space roughly equal to the database size and can take several minutes on a large database.
 
 ## Notes
 

@@ -41,6 +41,7 @@ class RecorderTunerPanel extends HTMLElement {
     this._error = null;
     this._notice = null;
     this._confirmSave = false;
+    this._confirm = null;
     this._busy = false;
   }
 
@@ -142,14 +143,19 @@ class RecorderTunerPanel extends HTMLElement {
     }
   }
 
-  async _purge() {
-    const ids = (this._data?.entities || []).filter((e) => e.in_yaml).map((e) => e.entity_id);
-    if (!ids.length) return;
-    this._busy = true; this._render();
+  _excludedIds() {
+    return (this._data?.entities || []).filter((e) => e.in_yaml).map((e) => e.entity_id);
+  }
+
+  // when: "now" | "after_restart"
+  async _purge(when) {
+    const ids = this._excludedIds();
+    this._busy = true; this._confirm = null; this._render();
     try {
-      await this._hass.callService("recorder", "purge_entities", { entity_id: ids, keep_days: 0 });
-      await this._hass.callService("recorder", "purge", { repack: true });
-      this._notice = { kind: "ok", text: `Purge queued for ${ids.length} entities, followed by a repack. The database shrinks once the recorder finishes (can take a few minutes).` };
+      const r = await this._hass.callWS({ type: "recorder_tuner/purge", entity_ids: ids, when });
+      this._notice = r.restarting
+        ? { kind: "ok", text: `Restarting… Once Home Assistant is back, the old history of ${r.queued} excluded entities is purged and the database repacked (a notification confirms it). Reload this page in a minute or two.` }
+        : { kind: "ok", text: `Purge queued for ${r.queued} entities, then a repack (SQLite VACUUM). The file shrinks when the recorder finishes, which can take several minutes on a large database.` };
     } catch (e) {
       this._notice = { kind: "error", text: e.message || String(e) };
     }
@@ -158,14 +164,21 @@ class RecorderTunerPanel extends HTMLElement {
   }
 
   async _restart() {
-    this._busy = true; this._render();
+    this._busy = true; this._confirm = null; this._render();
     try {
       await this._hass.callService("homeassistant", "restart", {});
+      this._notice = { kind: "info", text: "Restarting… reload this page in a minute or two." };
     } catch (e) {
       this._notice = { kind: "error", text: e.message || String(e) };
-      this._busy = false;
-      this._render();
     }
+    this._busy = false;
+    this._render();
+  }
+
+  _actionButton(act, label, confirmLabel, primary = false) {
+    if (this._confirm === act)
+      return `<button class="primary" data-act="${act}-go" ${this._busy ? "disabled" : ""}>${confirmLabel}</button><button data-act="confirm-cancel">Cancel</button>`;
+    return `<button class="${primary ? "primary" : ""}" data-act="${act}" ${this._busy ? "disabled" : ""}>${label}</button>`;
   }
 
   // ------------------------------------------------------------------ render
@@ -190,7 +203,10 @@ class RecorderTunerPanel extends HTMLElement {
       <div class="content">
         ${this._error ? `<div class="notice error">${esc(this._error)}</div>` : ""}
         ${this._notice ? `<div class="notice ${this._notice.kind}">${esc(this._notice.text)}
-            ${this._notice.saved ? `<div class="actions"><button data-act="restart" ${this._busy ? "disabled" : ""}>Restart Home Assistant</button></div>` : ""}
+            ${this._notice.saved ? `<div class="actions">
+                ${this._actionButton("restart-purge", "Restart & purge excluded", "Confirm restart + purge", true)}
+                ${this._actionButton("restart", "Restart only", "Confirm restart")}
+              </div>` : ""}
             <button class="x" data-act="dismiss" title="Dismiss">×</button></div>` : ""}
         ${d && !d.yaml.ok ? `<div class="notice error">Can't edit the recorder config: ${esc(d.yaml.error)}</div>` : ""}
 
@@ -224,7 +240,11 @@ class RecorderTunerPanel extends HTMLElement {
         <div class="savebar">
           <span>${add.length || remove.length ? `<b>Pending:</b> exclude ${add.length}, stop excluding ${remove.length}` : "No pending changes"}</span>
           <span class="grow"></span>
-          ${pendingExcluded ? `<button data-act="purge" ${this._busy ? "disabled" : ""} title="recorder.purge_entities + recorder.purge (repack)">Purge old history of excluded</button>` : ""}
+          ${pendingExcluded && !this._notice?.saved ? `
+            <span title="recorder.purge_entities for the excluded entities, then recorder.purge with repack: true (compacts the file)">
+              ${this._actionButton("purge", "Purge now", `Confirm purge of ${pendingExcluded}`)}
+              ${this._actionButton("restart-purge", "Restart & purge", "Confirm restart + purge")}
+            </span>` : ""}
           ${this._confirmSave
             ? `<button class="primary" data-act="save-confirm" ${this._busy ? "disabled" : ""}>Confirm – write ${esc(d?.yaml?.file?.split("/").pop() || "configuration.yaml")}</button><button data-act="save-cancel">Cancel</button>`
             : `<button class="primary" data-act="save" ${add.length || remove.length ? "" : "disabled"} ${d?.yaml?.ok ? "" : "disabled"}>Save to configuration.yaml</button>`}
@@ -255,7 +275,7 @@ class RecorderTunerPanel extends HTMLElement {
             }).join("")}
           </tbody>
         </table>
-        <p class="foot">Exclusions only stop <i>new</i> rows; use “Purge old history” to remove existing ones. Changes to <code>recorder:</code> need a full restart. A timestamped backup of the edited file is kept next to it (last 5).</p>
+        <p class="foot">Exclusions only stop <i>new</i> rows and need a full restart. <b>Restart &amp; purge</b> restarts, then deletes the excluded entities’ old rows and repacks (VACUUMs) the database so the file actually shrinks. A plain purge without repack frees space inside the file but doesn’t make it smaller. A timestamped backup of the edited file is kept next to it (last 5).</p>
       </div>`;
 
     const mb = this.shadowRoot.querySelector("ha-menu-button");
@@ -285,8 +305,11 @@ class RecorderTunerPanel extends HTMLElement {
         case "save": this._confirmSave = true; this._render(); break;
         case "save-cancel": this._confirmSave = false; this._render(); break;
         case "save-confirm": this._save(); break;
-        case "purge": this._purge(); break;
-        case "restart": this._restart(); break;
+        case "purge": case "restart": case "restart-purge": this._confirm = b.dataset.act; this._render(); break;
+        case "confirm-cancel": this._confirm = null; this._render(); break;
+        case "purge-go": this._purge("now"); break;
+        case "restart-purge-go": this._purge("after_restart"); break;
+        case "restart-go": this._restart(); break;
         case "dismiss": this._notice = null; this._render(); break;
       }
     }));

@@ -17,7 +17,7 @@ from homeassistant.components.recorder.util import session_scope
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import config_validation as cv, entity_registry as er
 
-from . import yaml_editor
+from . import purge, yaml_editor
 from .const import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
@@ -33,6 +33,7 @@ def async_register(hass: HomeAssistant) -> None:
         return
     websocket_api.async_register_command(hass, ws_analyze)
     websocket_api.async_register_command(hass, ws_save)
+    websocket_api.async_register_command(hass, ws_purge)
     data["ws_registered"] = True
 
 
@@ -257,4 +258,47 @@ async def ws_save(hass: HomeAssistant, connection: websocket_api.ActiveConnectio
             "removed": result.removed,
             "preexisting_errors": sorted(errors_before),
         },
+    )
+
+
+# --------------------------------------------------------------------------- purge
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/purge",
+        vol.Optional("entity_ids", default=[]): [cv.entity_id],
+        vol.Optional("when", default="now"): vol.In(["now", "after_restart"]),
+    }
+)
+@websocket_api.async_response
+async def ws_purge(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict) -> None:
+    """Purge + repack now, or restart HA and purge once it is back up."""
+    ids: list[str] = msg["entity_ids"]
+
+    if msg["when"] == "now":
+        try:
+            await purge.async_purge_now(hass, ids)
+        except Exception as err:  # noqa: BLE001
+            connection.send_error(msg["id"], "purge_failed", str(err))
+            return
+        connection.send_result(msg["id"], {"queued": len(ids), "restarting": False})
+        return
+
+    # after_restart: HA refuses to restart with an invalid config, so check first
+    # rather than leaving a purge pending for some later boot.
+    errors = await _config_errors(hass)
+    if errors:
+        connection.send_error(
+            msg["id"], "config_invalid",
+            "Home Assistant won't restart with config errors: " + "; ".join(sorted(errors)),
+        )
+        return
+
+    await purge.async_schedule_after_restart(hass, ids)
+    connection.send_result(msg["id"], {"queued": len(ids), "restarting": True})
+    hass.async_create_task(
+        hass.services.async_call("homeassistant", "restart", {}, blocking=False),
+        f"{DOMAIN}_restart",
     )

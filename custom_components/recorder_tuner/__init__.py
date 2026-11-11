@@ -12,7 +12,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers import config_validation as cv
 from homeassistant.loader import async_get_integration
 
-from . import websocket
+from . import purge, websocket
 from .const import (
     DOMAIN,
     PANEL_COMPONENT,
@@ -44,6 +44,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Recorder Tuner from a config entry."""
     await _register_static(hass)
     websocket.async_register(hass)
+    await purge.async_run_pending(hass)
 
     version = str((await async_get_integration(hass, DOMAIN)).version)
 
